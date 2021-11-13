@@ -21,10 +21,10 @@
 #include "captouch.h"
 
 #include <toboot.h>
-TOBOOT_CONFIGURATION(0);
+//TOBOOT_CONFIGURATION(0);
 // Use below line instead of above to autorun program on inserting Tomu board
 // You will need to connect the outer two button tracks to reprogram again
-// TOBOOT_CONFIGURATION(TOBOOT_CONFIG_FLAG_AUTORUN);
+TOBOOT_CONFIGURATION(TOBOOT_CONFIG_FLAG_AUTORUN);
 
 #define CAP0B_PORT GPIOE
 #define CAP0B_PIN GPIO12
@@ -32,7 +32,7 @@ TOBOOT_CONFIGURATION(0);
 #define CAP1B_PIN GPIO13
 
 // Minimum values for the capsense detect to work
-#define CAPSENSE_DETECT_MIN 600
+#define CAPSENSE_DETECT_MIN 100
 
 #pragma warning "Re-defining TIMER_CC_CTRL_INSEL because it's wrong"
 #undef TIMER_CC_CTRL_INSEL
@@ -100,7 +100,6 @@ void capsense_start(void);
 void capsense_stop(void);
 void setup_acmp_capsense(const struct acmp_capsense_init *init);
 static void setup_capsense(void);
-static void setup(void);
 
 // Declare functions
 void injkeys(char *source, uint8_t mod);
@@ -264,6 +263,8 @@ static void hid_set_config(usbd_device *dev, uint16_t wValue) {
 void usb_isr(void) { usbd_poll(g_usbd_dev); }
 
 void hard_fault_handler(void) {
+  // Light the green light on a hard fault.
+  gpio_clear(LED_GREEN_PORT, LED_GREEN_PIN);
   while (1)
     ;
 }
@@ -366,8 +367,32 @@ void sys_tick_handler(void)
 	timer32++;
 }
 
+bool debounce(bool raw) {
+  const uint32_t DEBOUNCE = 50;
+
+  static bool cooked = false;
+  static bool last_raw = false;
+  static uint32_t remaining = 0;
+  static uint32_t last_time = 0;
+
+  uint32_t now = timer32;
+  uint32_t elapsed = now - last_time;
+  last_time = now;
+
+  if (raw != last_raw) {
+	remaining = DEBOUNCE;
+	last_raw = raw;
+  } else if (remaining > elapsed) {
+	remaining -= elapsed;
+  } else {
+    remaining = 0;
+	cooked = raw;
+  }
+
+  return cooked;
+}
+
 int main(void) {
-  uint32_t last_generation = 0;
   /* Make sure the vector table is relocated correctly (after the Tomu
    * bootloader) */
   SCB_VTOR = 0x4000;
@@ -375,19 +400,28 @@ int main(void) {
   /* Disable the watchdog that the bootloader started. */
   WDOG_CTRL = 0;
 
-  // Setup much of the functionality necessary for the program
-  setup();
+  /* GPIO peripheral clock is necessary for us to set up the GPIO pins as
+   * outputs */
+  cmu_periph_clock_enable(CMU_GPIO);
+
+  /* Set up both LEDs as outputs */
+  gpio_mode_setup(LED_RED_PORT, GPIO_MODE_WIRED_AND, LED_RED_PIN);
+  gpio_mode_setup(LED_GREEN_PORT, GPIO_MODE_WIRED_AND, LED_GREEN_PIN);
+
+  // Disable GPIO for pin PC1 (CAP1A, red LED button).
+  // This pin was enabled as Output by Toboot bootloader, it interferes with the
+  // analog comparator.
+  gpio_mode_setup(GPIOC, GPIO_MODE_DISABLE, GPIO1);
+
+  setup_capsense();
 
   // Start the capsense functionality
   capsense_start();
 
-  // Set both LEDs to turn them off
-  gpio_set(LED_GREEN_PORT, LED_GREEN_PIN);
+  // Set red to turn it off.
   gpio_set(LED_RED_PORT, LED_RED_PIN);
-
-  /* GPIO peripheral clock is necessary for us to set up the GPIO pins as
-   * outputs */
-  cmu_periph_clock_enable(CMU_GPIO);
+  // Light green until USB initialization succeeds.
+  gpio_clear(LED_GREEN_PORT, LED_GREEN_PIN);
 
   /* Configure the USB core & stack */
   g_usbd_dev = usbd_init(&efm32hg_usb_driver, &dev_descr, &config, usb_strings,
@@ -404,8 +438,14 @@ int main(void) {
   systick_interrupt_enable();
   nvic_set_priority(NVIC_SYSTICK_IRQ, 0x10);
 
+  // We can't send any packets until USB initialization succeeds.
+  while (!g_usbd_is_connected) {
+  }
+  gpio_set(LED_GREEN_PORT, LED_GREEN_PIN);
+
   bool was_pressed = false;
 
+  uint32_t last_generation = 0;
   while (1) {
     // Function to delay until the newest value from the capacitive buttons has
     // come through Notice the use of == instead of >= as at some point this
@@ -423,9 +463,10 @@ int main(void) {
       // Use the sum of their values to determine if a button has been pressed
       sum += g_channel_values[i];
     }
-
     // Minimum threshold for the button press to register
-	bool is_pressed = sum > CAPSENSE_DETECT_MIN;
+	bool is_pressed_raw = sum > CAPSENSE_DETECT_MIN;
+
+	bool is_pressed = debounce(is_pressed_raw);
 	if (is_pressed != was_pressed) {
 		bool success = false;
 		// TODO: this needs some debouncing
@@ -658,21 +699,4 @@ static void setup_capsense(void) {
 
   /* Enable TIMER0 interrupt */
   nvic_enable_irq(NVIC_TIMER0_IRQ);
-}
-
-static void setup(void) {
-  /* GPIO peripheral clock is necessary for us to set up the GPIO pins as
-   * outputs */
-  cmu_periph_clock_enable(CMU_GPIO);
-
-  /* Set up both LEDs as outputs */
-  gpio_mode_setup(LED_RED_PORT, GPIO_MODE_WIRED_AND, LED_RED_PIN);
-  gpio_mode_setup(LED_GREEN_PORT, GPIO_MODE_WIRED_AND, LED_GREEN_PIN);
-
-  // Disable GPIO for pin PC1 (CAP1A, red LED button).
-  // This pin was enabled as Output by Toboot bootloader, it interferes with the
-  // analog comparator.
-  gpio_mode_setup(GPIOC, GPIO_MODE_DISABLE, GPIO1);
-
-  setup_capsense();
 }
